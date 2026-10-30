@@ -90,6 +90,8 @@ PRICING_PROFILES: Dict[str, Dict[str, Any]] = {
 
 VALID_DAYS_FILTERS = ("7", "30", "90", "365", "all")
 VALID_BILLING_MODES = ("context", "turn")
+# Available models populated dynamically from DB at runtime
+DEFAULT_MODEL_FILTER = "all"
 
 # Energy & Carbon coefficients:
 # 0.08 Wh per 1k input tokens = 0.00008 Wh/token
@@ -1680,6 +1682,7 @@ class UsageTracker:
         days: str = "30",
         pricing: str = "blended",
         billing_mode: str = "context",
+        model: str = "all",
     ) -> Dict[str, Any]:
         """Compute the full `/api/stats` payload."""
         days_norm = str(days or "30").strip().lower()
@@ -1695,6 +1698,11 @@ class UsageTracker:
             billing_norm = "turn"
         if billing_norm not in VALID_BILLING_MODES:
             billing_norm = "context"
+
+        model_norm = str(model or "all").strip().lower()
+        available_models = self._get_available_models()
+        if model_norm != "all" and model_norm not in available_models:
+            model_norm = "all"
 
         use_context = billing_norm == "context"
 
@@ -1712,10 +1720,14 @@ class UsageTracker:
                 cutoff_date = today_date - dt.timedelta(days=n_days - 1)
                 cutoff_str = cutoff_date.strftime("%Y-%m-%d")
 
+            # Build model filter clause
+            model_filter = "" if model_norm == "all" else "AND model = ?"
+            model_params = [] if model_norm == "all" else [model_norm]
+
             # 1) Daily breakdown within selected window
             if cutoff_str is not None:
                 daily_rows = conn.execute(
-                    """
+                    f"""
                     SELECT
                         local_date,
                         SUM(unique_input_tokens) AS uniq_in,
@@ -1735,7 +1747,7 @@ class UsageTracker:
                 ).fetchall()
             else:
                 daily_rows = conn.execute(
-                    """
+                    f"""
                     SELECT
                         local_date,
                         SUM(unique_input_tokens) AS uniq_in,
@@ -1747,9 +1759,11 @@ class UsageTracker:
                         SUM(subagent_spawns) AS subagents,
                         COUNT(DISTINCT conversation_id) AS conv_count
                     FROM events
+                    WHERE 1=1 {model_filter}
                     GROUP BY local_date
                     ORDER BY local_date ASC
-                    """
+                    """,
+                    tuple(model_params),
                 ).fetchall()
 
             by_date: Dict[str, sqlite3.Row] = {str(r["local_date"]): r for r in daily_rows}
@@ -1898,7 +1912,7 @@ class UsageTracker:
             hm_start = today_date - dt.timedelta(days=364)
             hm_start_str = hm_start.strftime("%Y-%m-%d")
             hm_rows = conn.execute(
-                """
+                f"""
                 SELECT
                     local_date,
                     SUM(unique_input_tokens) AS uniq_in,
@@ -1907,10 +1921,10 @@ class UsageTracker:
                     SUM(thinking_tokens) AS think_tok,
                     SUM(is_api_request) AS api_reqs
                 FROM events
-                WHERE local_date >= ? AND local_date <= ?
+                WHERE local_date >= ? AND local_date <= ? {model_filter}
                 GROUP BY local_date
                 """,
-                (hm_start_str, today_str),
+                (hm_start_str, today_str) + tuple(model_params),
             ).fetchall()
             hm_map = {str(r["local_date"]): r for r in hm_rows}
             hm_raw_entries: List[Dict[str, Any]] = []
@@ -1947,7 +1961,7 @@ class UsageTracker:
             # 4) Hourly distribution (0..23) in selected window
             if cutoff_str is not None:
                 hr_rows = conn.execute(
-                    """
+                    f"""
                     SELECT
                         local_hour,
                         SUM(unique_input_tokens) AS uniq_in,
@@ -1956,14 +1970,14 @@ class UsageTracker:
                         SUM(thinking_tokens) AS think_tok,
                         SUM(is_api_request) AS api_reqs
                     FROM events
-                    WHERE local_date >= ? AND local_date <= ?
+                    WHERE local_date >= ? AND local_date <= ? {model_filter}
                     GROUP BY local_hour
                     """,
-                    (cutoff_str, today_str),
+                    (cutoff_str, today_str) + tuple(model_params),
                 ).fetchall()
             else:
                 hr_rows = conn.execute(
-                    """
+                    f"""
                     SELECT
                         local_hour,
                         SUM(unique_input_tokens) AS uniq_in,
@@ -1972,8 +1986,10 @@ class UsageTracker:
                         SUM(thinking_tokens) AS think_tok,
                         SUM(is_api_request) AS api_reqs
                     FROM events
+                    WHERE 1=1 {model_filter}
                     GROUP BY local_hour
-                    """
+                    """,
+                    tuple(model_params),
                 ).fetchall()
 
             hr_map = {int(r["local_hour"]): r for r in hr_rows}
@@ -1997,34 +2013,77 @@ class UsageTracker:
 
             # 5) Top 12 tools in selected window
             if cutoff_str is not None:
-                tool_total_row = conn.execute(
-                    "SELECT COALESCE(SUM(call_count), 0) AS total FROM tool_usages WHERE local_date >= ? AND local_date <= ?",
-                    (cutoff_str, today_str),
-                ).fetchone()
-                tool_rows = conn.execute(
-                    """
-                    SELECT tool_name, SUM(call_count) AS cnt
-                    FROM tool_usages
-                    WHERE local_date >= ? AND local_date <= ?
-                    GROUP BY tool_name
-                    ORDER BY cnt DESC, tool_name ASC
-                    LIMIT 12
-                    """,
-                    (cutoff_str, today_str),
-                ).fetchall()
+                if model_norm == "all":
+                    tool_total_row = conn.execute(
+                        "SELECT COALESCE(SUM(call_count), 0) AS total FROM tool_usages WHERE local_date >= ? AND local_date <= ?",
+                        (cutoff_str, today_str),
+                    ).fetchone()
+                    tool_rows = conn.execute(
+                        """
+                        SELECT tool_name, SUM(call_count) AS cnt
+                        FROM tool_usages
+                        WHERE local_date >= ? AND local_date <= ?
+                        GROUP BY tool_name
+                        ORDER BY cnt DESC, tool_name ASC
+                        LIMIT 12
+                        """,
+                        (cutoff_str, today_str),
+                    ).fetchall()
+                else:
+                    # Filter tools by model via join with events
+                    tool_total_row = conn.execute(
+                        """SELECT COALESCE(SUM(tu.call_count), 0) AS total
+                           FROM tool_usages tu
+                           JOIN events e ON tu.conversation_id = e.conversation_id
+                           WHERE tu.local_date >= ? AND tu.local_date <= ? AND e.model = ?""",
+                        (cutoff_str, today_str, model_norm),
+                    ).fetchone()
+                    tool_rows = conn.execute(
+                        """
+                        SELECT tu.tool_name, SUM(tu.call_count) AS cnt
+                        FROM tool_usages tu
+                        JOIN events e ON tu.conversation_id = e.conversation_id
+                        WHERE tu.local_date >= ? AND tu.local_date <= ? AND e.model = ?
+                        GROUP BY tu.tool_name
+                        ORDER BY cnt DESC, tu.tool_name ASC
+                        LIMIT 12
+                        """,
+                        (cutoff_str, today_str, model_norm),
+                    ).fetchall()
             else:
-                tool_total_row = conn.execute(
-                    "SELECT COALESCE(SUM(call_count), 0) AS total FROM tool_usages"
-                ).fetchone()
-                tool_rows = conn.execute(
-                    """
-                    SELECT tool_name, SUM(call_count) AS cnt
-                    FROM tool_usages
-                    GROUP BY tool_name
-                    ORDER BY cnt DESC, tool_name ASC
-                    LIMIT 12
-                    """
-                ).fetchall()
+                if model_norm == "all":
+                    tool_total_row = conn.execute(
+                        "SELECT COALESCE(SUM(call_count), 0) AS total FROM tool_usages"
+                    ).fetchone()
+                    tool_rows = conn.execute(
+                        """
+                        SELECT tool_name, SUM(call_count) AS cnt
+                        FROM tool_usages
+                        GROUP BY tool_name
+                        ORDER BY cnt DESC, tool_name ASC
+                        LIMIT 12
+                        """
+                    ).fetchall()
+                else:
+                    tool_total_row = conn.execute(
+                        """SELECT COALESCE(SUM(tu.call_count), 0) AS total
+                           FROM tool_usages tu
+                           JOIN events e ON tu.conversation_id = e.conversation_id
+                           WHERE e.model = ?""",
+                        (model_norm,),
+                    ).fetchone()
+                    tool_rows = conn.execute(
+                        """
+                        SELECT tu.tool_name, SUM(tu.call_count) AS cnt
+                        FROM tool_usages tu
+                        JOIN events e ON tu.conversation_id = e.conversation_id
+                        WHERE e.model = ?
+                        GROUP BY tu.tool_name
+                        ORDER BY cnt DESC, tu.tool_name ASC
+                        LIMIT 12
+                        """,
+                        (model_norm,),
+                    ).fetchall()
 
             all_tools_sum = int(tool_total_row["total"] or 0)
             tools_list: List[Dict[str, Any]] = []
@@ -2041,29 +2100,62 @@ class UsageTracker:
 
             # 6) Up to 100 most recent conversations active in selected window
             if cutoff_str is not None:
-                conv_rows = conn.execute(
-                    """
-                    SELECT c.*
-                    FROM conversations c
-                    WHERE EXISTS (
-                        SELECT 1 FROM events e
-                        WHERE e.conversation_id = c.id
-                          AND e.local_date >= ? AND e.local_date <= ?
-                    )
-                    ORDER BY c.updated_at DESC
-                    LIMIT 100
-                    """,
-                    (cutoff_str, today_str),
-                ).fetchall()
+                if model_norm == "all":
+                    conv_rows = conn.execute(
+                        """
+                        SELECT c.*
+                        FROM conversations c
+                        WHERE EXISTS (
+                            SELECT 1 FROM events e
+                            WHERE e.conversation_id = c.id
+                              AND e.local_date >= ? AND e.local_date <= ?
+                        )
+                        ORDER BY c.updated_at DESC
+                        LIMIT 100
+                        """,
+                        (cutoff_str, today_str),
+                    ).fetchall()
+                else:
+                    conv_rows = conn.execute(
+                        """
+                        SELECT c.*
+                        FROM conversations c
+                        WHERE EXISTS (
+                            SELECT 1 FROM events e
+                            WHERE e.conversation_id = c.id
+                              AND e.local_date >= ? AND e.local_date <= ?
+                              AND e.model = ?
+                        )
+                        ORDER BY c.updated_at DESC
+                        LIMIT 100
+                        """,
+                        (cutoff_str, today_str, model_norm),
+                    ).fetchall()
             else:
-                conv_rows = conn.execute(
-                    """
-                    SELECT *
-                    FROM conversations
-                    ORDER BY updated_at DESC
-                    LIMIT 100
-                    """
-                ).fetchall()
+                if model_norm == "all":
+                    conv_rows = conn.execute(
+                        """
+                        SELECT *
+                        FROM conversations
+                        ORDER BY updated_at DESC
+                        LIMIT 100
+                        """
+                    ).fetchall()
+                else:
+                    conv_rows = conn.execute(
+                        """
+                        SELECT c.*
+                        FROM conversations c
+                        WHERE EXISTS (
+                            SELECT 1 FROM events e
+                            WHERE e.conversation_id = c.id
+                              AND e.model = ?
+                        )
+                        ORDER BY c.updated_at DESC
+                        LIMIT 100
+                        """,
+                        (model_norm,),
+                    ).fetchall()
 
             conversations_list: List[Dict[str, Any]] = []
             for c in conv_rows:
@@ -2107,8 +2199,13 @@ class UsageTracker:
                 "days_filter": days_norm,
                 "pricing_profile": pricing_norm,
                 "billing_mode": billing_norm,
+                "model_filter": model_norm,
+                "available_models": available_models,
                 "pricing_profiles": PRICING_PROFILES,
             }
+
+            # Get per-model breakdown for all models (ignoring current model filter)
+            models_breakdown = self._get_models_breakdown(days_norm, billing_norm, pricing_norm)
 
             return {
                 "meta": meta_obj,
@@ -2118,7 +2215,103 @@ class UsageTracker:
                 "hourly": hourly_list,
                 "tools": tools_list,
                 "conversations": conversations_list,
+                "models_breakdown": models_breakdown,
             }
+
+    def _get_available_models(self) -> List[str]:
+        """Return sorted list of distinct models from events table (excludes 'unknown')."""
+        with self.lock:
+            rows = self._active_conn.execute(
+                "SELECT DISTINCT model FROM events WHERE model != 'unknown' ORDER BY model"
+            ).fetchall()
+            return [r["model"] for r in rows]
+
+    def _get_models_breakdown(self, days_filter: str, billing_mode: str, pricing: str) -> List[Dict[str, Any]]:
+        """Return per-model aggregate metrics for the dashboard."""
+        with self.lock:
+            conn = self._active_conn
+            local_tz = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+            today_date = dt.datetime.now(tz=local_tz).date()
+            today_str = today_date.strftime("%Y-%m-%d")
+
+            if days_filter == "all":
+                cutoff_str = None
+            else:
+                n_days = int(days_filter)
+                cutoff_date = today_date - dt.timedelta(days=n_days - 1)
+                cutoff_str = cutoff_date.strftime("%Y-%m-%d")
+
+            use_context = billing_mode == "context"
+
+            if cutoff_str is not None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        model,
+                        SUM(unique_input_tokens) AS uniq_in,
+                        SUM(context_input_tokens) AS ctx_in,
+                        SUM(output_tokens) AS out_tok,
+                        SUM(thinking_tokens) AS think_tok,
+                        SUM(is_api_request) AS api_reqs,
+                        SUM(tool_calls_count) AS tool_calls,
+                        COUNT(DISTINCT conversation_id) AS conv_count
+                    FROM events
+                    WHERE local_date >= ? AND local_date <= ?
+                    GROUP BY model
+                    ORDER BY (SUM(context_input_tokens) + SUM(output_tokens) + SUM(thinking_tokens)) DESC
+                    """,
+                    (cutoff_str, today_str),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        model,
+                        SUM(unique_input_tokens) AS uniq_in,
+                        SUM(context_input_tokens) AS ctx_in,
+                        SUM(output_tokens) AS out_tok,
+                        SUM(thinking_tokens) AS think_tok,
+                        SUM(is_api_request) AS api_reqs,
+                        SUM(tool_calls_count) AS tool_calls,
+                        COUNT(DISTINCT conversation_id) AS conv_count
+                    FROM events
+                    GROUP BY model
+                    ORDER BY (SUM(context_input_tokens) + SUM(output_tokens) + SUM(thinking_tokens)) DESC
+                    """
+                ).fetchall()
+
+            profile = PRICING_PROFILES.get(pricing, PRICING_PROFILES["blended"])
+            results = []
+            for r in rows:
+                model_name = r["model"] or "unknown"
+                if model_name == "unknown":
+                    continue
+                eff_i = int(r["ctx_in"] or 0) if use_context else int(r["uniq_in"] or 0)
+                o_t = int(r["out_tok"] or 0)
+                t_t = int(r["think_tok"] or 0)
+                reqs = int(r["api_reqs"] or 0)
+                tools = int(r["tool_calls"] or 0)
+                convs = int(r["conv_count"] or 0)
+                tot_t = eff_i + o_t + t_t
+                cost = compute_cost_usd(eff_i, o_t, t_t, pricing)
+                energy = compute_energy_metrics(eff_i, o_t, t_t)
+                results.append({
+                    "model": model_name,
+                    "total_tokens": tot_t,
+                    "effective_input_tokens": eff_i,
+                    "unique_input_tokens": int(r["uniq_in"] or 0),
+                    "context_input_tokens": int(r["ctx_in"] or 0),
+                    "output_tokens": o_t,
+                    "thinking_tokens": t_t,
+                    "api_requests": reqs,
+                    "conversations": convs,
+                    "tool_calls": tools,
+                    "cost_usd": round(cost, 6),
+                    "electricity_wh": round(energy["electricity_wh"], 4),
+                    "co2_grams": round(energy["co2_grams"], 4),
+                    "avg_tokens_per_req": round(tot_t / reqs, 1) if reqs > 0 else 0.0,
+                })
+            return results
 
     def export_daily_csv(
         self,
@@ -2241,8 +2434,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             days = qs.get("days", ["30"])[0]
             pricing = qs.get("pricing", ["blended"])[0]
             billing_mode = qs.get("billing_mode", ["context"])[0]
+            model = qs.get("model", ["all"])[0]
             stats = self.server.tracker.get_stats(
-                days=days, pricing=pricing, billing_mode=billing_mode
+                days=days, pricing=pricing, billing_mode=billing_mode, model=model
             )
             self._send_json(stats)
             return
@@ -2251,8 +2445,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             days = qs.get("days", ["all"])[0]
             pricing = qs.get("pricing", ["blended"])[0]
             billing_mode = qs.get("billing_mode", ["context"])[0]
+            model = qs.get("model", ["all"])[0]
             csv_text = self.server.tracker.export_daily_csv(
-                days=days, pricing=pricing, billing_mode=billing_mode
+                days=days, pricing=pricing, billing_mode=billing_mode, model=model
             )
             filename = f"agy_usage_{days}_{billing_mode}.csv"
             self._send_bytes(
