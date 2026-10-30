@@ -750,6 +750,7 @@ CREATE TABLE IF NOT EXISTS events (
     local_date TEXT NOT NULL,
     local_hour INTEGER NOT NULL,
     event_type TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT 'unknown',
     is_api_request INTEGER NOT NULL DEFAULT 0,
     unique_input_tokens INTEGER NOT NULL DEFAULT 0,
     context_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -770,6 +771,7 @@ CREATE TABLE IF NOT EXISTS tool_usages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_date ON events(local_date);
+CREATE INDEX IF NOT EXISTS idx_events_model ON events(model);
 CREATE INDEX IF NOT EXISTS idx_events_conv ON events(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_tools_date ON tool_usages(local_date);
 CREATE INDEX IF NOT EXISTS idx_tools_conv ON tool_usages(conversation_id);
@@ -793,9 +795,45 @@ def init_sqlite_connection(db_path: str) -> sqlite3.Connection:
             pass
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.executescript(SCHEMA_SQL)
+    try:
+        conn.execute("ALTER TABLE events ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_model ON events(model)")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     return conn
 
+
+_MODEL_NAME_RE = re.compile(
+    r'(gemini-[\w\.-]+|claude-[\w\.-]+|gpt-[\w\.-]+|chatgpt-[\w\.-]+|deepseek-[\w\.-]+|qwen[\w\.-]*|llama-[\w\.-]+|o\d(?:-[\w\.-]+)?)',
+    re.IGNORECASE,
+)
+
+def extract_step_model(step: Dict[str, Any], fallback: str = "unknown") -> str:
+    """Extract model name from step dictionary, metadata, or inference instructions."""
+    for key in ("model", "model_name", "llm", "engine"):
+        val = step.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    for meta_key in ("metadata", "meta", "extra", "info"):
+        sub = step.get(meta_key)
+        if isinstance(sub, dict):
+            for key in ("model", "model_name", "llm", "engine"):
+                val = sub.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+    content = step.get("content")
+    if isinstance(content, str):
+        m = re.search(r'Model:\s*([a-zA-Z0-9_\.-]+)', content)
+        if m:
+            return m.group(1).strip()
+        m2 = _MODEL_NAME_RE.search(content[:500])
+        if m2:
+            return m2.group(1).strip()
+    return fallback
 
 def parse_conversation_incremental(
     conn: sqlite3.Connection,
@@ -877,6 +915,7 @@ def parse_conversation_incremental(
     new_events: List[Tuple[Any, ...]] = []
     new_tools: List[Tuple[str, str, str, int]] = []
     committed_offset = start_offset
+    current_conv_model = "unknown"
 
     try:
         with transcript_path.open("rb") as fh:
@@ -911,6 +950,10 @@ def parse_conversation_incremental(
 
                 if step.get("truncated_fields"):
                     step = resolver.resolve(step, lines_parsed)
+
+                step_model = extract_step_model(step, fallback=current_conv_model)
+                if step_model != "unknown":
+                    current_conv_model = step_model
 
                 step_idx_raw = step.get("step_index")
                 step_idx = step_idx_raw if isinstance(step_idx_raw, int) else lines_parsed
@@ -1017,6 +1060,7 @@ def parse_conversation_incremental(
                         local_date,
                         local_hour,
                         step_type or source or "UNKNOWN",
+                        current_conv_model,
                         is_api_req,
                         uniq_in,
                         ctx_in,
@@ -1093,9 +1137,9 @@ def parse_conversation_incremental(
             """
             INSERT INTO events (
                 conversation_id, step_index, timestamp, local_date, local_hour,
-                event_type, is_api_request, unique_input_tokens, context_input_tokens,
+                event_type, model, is_api_request, unique_input_tokens, context_input_tokens,
                 output_tokens, thinking_tokens, tool_calls_count, subagent_spawns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             new_events,
         )
@@ -1303,6 +1347,7 @@ def seed_demo_data(conn: sqlite3.Connection, today: Optional[dt.date] = None) ->
 
         conv_id = f"demo-{idx + 1:02d}-{rng.randrange(16**8):08x}"
         title = _DEMO_TITLES[idx % len(_DEMO_TITLES)]
+        demo_model = rng.choices(["gemini-3.8-flash", "claude-3-5-sonnet", "gemini-2.5-pro", "chatgpt-4o"], weights=[45, 30, 15, 10])[0]
 
         # Heavy architecture/debugging spike every ~5th session
         is_deep_session = (idx % 5 == 1) or (delta == 0)
@@ -1332,6 +1377,7 @@ def seed_demo_data(conn: sqlite3.Connection, today: Optional[dt.date] = None) ->
                 cur_dt.strftime("%Y-%m-%d"),
                 cur_dt.hour,
                 "USER_INPUT",
+                demo_model,
                 0,
                 init_prompt_tok,
                 0,
@@ -1389,6 +1435,7 @@ def seed_demo_data(conn: sqlite3.Connection, today: Optional[dt.date] = None) ->
                     ev_date,
                     ev_hour,
                     "PLANNER_RESPONSE",
+                    demo_model,
                     1,
                     0,
                     ctx_in,
@@ -1418,6 +1465,7 @@ def seed_demo_data(conn: sqlite3.Connection, today: Optional[dt.date] = None) ->
                         cur_dt.strftime("%Y-%m-%d"),
                         cur_dt.hour,
                         "TOOL_RESPONSE" if tc_count > 0 else "USER_INPUT",
+                        demo_model,
                         0,
                         follow_tok,
                         0,
@@ -1469,9 +1517,9 @@ def seed_demo_data(conn: sqlite3.Connection, today: Optional[dt.date] = None) ->
         """
         INSERT INTO events (
             conversation_id, step_index, timestamp, local_date, local_hour,
-            event_type, is_api_request, unique_input_tokens, context_input_tokens,
+            event_type, model, is_api_request, unique_input_tokens, context_input_tokens,
             output_tokens, thinking_tokens, tool_calls_count, subagent_spawns
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         event_rows,
     )
