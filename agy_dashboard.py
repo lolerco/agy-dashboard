@@ -151,7 +151,7 @@ try:
 except Exception:
     _TIKTOKEN_ENC = None
 
-_CODE_PUNCT_CHARS = "{}[]()<>:;,.=+-*/\|&^%$#@!~?\"'`"
+_CODE_PUNCT_CHARS = "{}[]()<>:;,.=+-*/\\|&^%$#@!~?\"'`"
 
 
 def _flatten_to_text(value: Any) -> str:
@@ -773,7 +773,6 @@ CREATE TABLE IF NOT EXISTS tool_usages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_date ON events(local_date);
-CREATE INDEX IF NOT EXISTS idx_events_model ON events(model);
 CREATE INDEX IF NOT EXISTS idx_events_conv ON events(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_tools_date ON tool_usages(local_date);
 CREATE INDEX IF NOT EXISTS idx_tools_conv ON tool_usages(conversation_id);
@@ -796,6 +795,11 @@ def init_sqlite_connection(db_path: str) -> sqlite3.Connection:
         except sqlite3.Error:
             pass
     conn.execute("PRAGMA foreign_keys=ON;")
+    # Run schema creation
+    try:
+        conn.execute("ALTER TABLE events ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'")
+    except sqlite3.OperationalError:
+        pass
     conn.executescript(SCHEMA_SQL)
     try:
         conn.execute("ALTER TABLE events ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'")
