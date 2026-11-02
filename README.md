@@ -108,5 +108,22 @@ Environmental estimates model active LLM inference physics rather than flat per-
 - **Energy (Wh / kWh):** Separates lower-cost parallel **prefill** (input tokens) from memory-bandwidth-bound autoregressive **decode** (output + thinking tokens) using published datacenter TPU/GPU Wh-per-1k-token benchmarks, scaled by datacenter **PUE (Power Usage Effectiveness)**.
 - **Carbon Footprint (gCO₂e / kgCO₂e):** Multiplies estimated kWh consumption by standard cloud/grid carbon intensity (`gCO₂e/kWh`) to surface practical equivalents.
 
-### 5. Incremental SQLite Caching
+### 5. Incremental SQLite Caching & Multi-Device Synchronization
 Parsing thousands of `.jsonl` agent trajectories on every page load is slow. `agy_dashboard.py` uses Python's built-in `sqlite3` module to persist computed per-conversation, daily, hourly, and tool statistics keyed by transcript path, modification timestamp (`mtime`), and file size. Unchanged sessions load instantaneously from SQLite; only newly created or actively growing transcripts are re-indexed.
+
+#### Multi-Device Syncing with Syncthing (or Git / rsync)
+Each machine maintains its own isolated database under `~/.agy_dashboard/<device_name>.db` (defaulting to the host machine's hostname). When syncing across multiple devices, `agy_dashboard.py` automatically discovers all `*.db` files in `~/.agy_dashboard/` and unifies them in-memory, allowing cross-device stats, filtering, and badging without database file locking conflicts.
+
+**Setting up with Syncthing:**
+1. Sync `~/.agy_dashboard/` across your machines.
+2. In Syncthing's folder ignore patterns (`.stignore`), exclude active SQLite WAL/temporary lock files:
+   ```text
+   *.db-wal
+   *.db-shm
+   *.db-journal
+   ```
+3. Each machine will read and write to its own `<device_name>.db` while receiving peer `<other_device>.db` files in the background.
+
+**Using Other Syncing Mechanisms (Git, rsync, cloud storage):**
+- If syncing via Git or backup scripts, ensure only the main `*.db` files are committed or copied (ignore `*.db-wal` and `*.db-shm`).
+- Because database filenames are unique per machine (`laptop.db`, `desktop.db`, `server.db`), there are no merge conflicts or concurrent SQLite lock contentions.

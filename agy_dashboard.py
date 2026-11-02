@@ -88,7 +88,7 @@ PRICING_PROFILES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-VALID_DAYS_FILTERS = ("7", "30", "90", "365", "all")
+VALID_DAYS_FILTERS = ("1", "7", "30", "90", "365", "all")
 VALID_BILLING_MODES = ("context", "turn")
 # Available models populated dynamically from DB at runtime
 DEFAULT_MODEL_FILTER = "all"
@@ -457,15 +457,29 @@ def _is_writable_sqlite_target(db_file: Path) -> bool:
         return False
 
 
+def get_machine_device_name() -> str:
+    """Return sanitized machine hostname for multi-device database isolation."""
+    raw = socket.gethostname().strip().lower()
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "_", raw)
+    return cleaned or "local"
+
+
+DEFAULT_DASHBOARD_DIR = Path.home() / ".agy_dashboard"
+
+
 def resolve_db_path(
     agy_dir: Path,
     cli_db: Optional[str] = None,
     demo_mode: bool = False,
+    device_name: Optional[str] = None,
 ) -> str:
     """Determine SQLite DB path.
 
-    Default: `<brain_dir>/../agy_usage.db` if writable, else
-    `~/.cache/agy-dashboard/agy_usage.db` (or `:memory:` for `--demo`).
+    Priority:
+    1. Explicit `--db` path (or `:memory:`)
+    2. Demo mode -> `:memory:`
+    3. Device-isolated database in `~/.agy_dashboard/<device_name>.db`
+    4. Fallbacks to brain sibling, ~/.gemini, ~/.cache, or :memory:
     """
     if cli_db:
         if cli_db == ":memory:":
@@ -476,6 +490,15 @@ def resolve_db_path(
 
     if demo_mode:
         return ":memory:"
+
+    dev = device_name or get_machine_device_name()
+    try:
+        DEFAULT_DASHBOARD_DIR.mkdir(parents=True, exist_ok=True)
+        target_db = DEFAULT_DASHBOARD_DIR / f"{dev}.db"
+        if _is_writable_sqlite_target(target_db):
+            return str(target_db)
+    except OSError:
+        pass
 
     agy_str = str(agy_dir.resolve()).lower()
     is_ephemeral = any(
@@ -732,6 +755,7 @@ class FullTranscriptResolver:
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
+    device TEXT NOT NULL DEFAULT 'local',
     file_path TEXT NOT NULL,
     title TEXT NOT NULL,
     started_at TEXT NOT NULL,
@@ -754,6 +778,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id TEXT NOT NULL,
+    device TEXT NOT NULL DEFAULT 'local',
     step_index INTEGER NOT NULL,
     timestamp TEXT NOT NULL,
     local_date TEXT NOT NULL,
@@ -802,12 +827,22 @@ def init_sqlite_connection(db_path: str) -> sqlite3.Connection:
         except sqlite3.Error:
             pass
     conn.execute("PRAGMA foreign_keys=ON;")
-    # Run schema creation
+    # Run schema migration & creation
+    for tbl, col, col_def in [
+        ("conversations", "device", "TEXT NOT NULL DEFAULT 'local'"),
+        ("events", "device", "TEXT NOT NULL DEFAULT 'local'"),
+        ("events", "model", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_def}")
+        except sqlite3.OperationalError:
+            pass
+    conn.executescript(SCHEMA_SQL)
     try:
-        conn.execute("ALTER TABLE events ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_device ON events(device)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_conv_device ON conversations(device)")
     except sqlite3.OperationalError:
         pass
-    conn.executescript(SCHEMA_SQL)
     try:
         conn.execute("ALTER TABLE events ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown'")
     except sqlite3.OperationalError:
@@ -853,6 +888,7 @@ def parse_conversation_incremental(
     conv_id: str,
     transcript_path: Path,
     force: bool = False,
+    device: str = "local",
 ) -> bool:
     """Parse new (or rewritten) lines from `transcript_path` into SQLite.
 
@@ -1068,6 +1104,7 @@ def parse_conversation_incremental(
                 new_events.append(
                     (
                         conv_id,
+                        device,
                         step_idx,
                         ts_iso,
                         local_date,
@@ -1098,13 +1135,14 @@ def parse_conversation_incremental(
     conn.execute(
         """
         INSERT INTO conversations (
-            id, file_path, title, started_at, updated_at,
+            id, device, file_path, title, started_at, updated_at,
             mtime_ns, file_size, byte_offset, lines_parsed,
             running_context, has_user_title,
             api_requests, tool_calls, subagent_spawns,
             unique_input_tokens, context_input_tokens, output_tokens, thinking_tokens
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
+            device = excluded.device,
             file_path = excluded.file_path,
             title = excluded.title,
             started_at = excluded.started_at,
@@ -1125,6 +1163,7 @@ def parse_conversation_incremental(
         """,
         (
             conv_id,
+            device,
             str(transcript_path),
             title,
             started_at,
@@ -1149,10 +1188,10 @@ def parse_conversation_incremental(
         conn.executemany(
             """
             INSERT INTO events (
-                conversation_id, step_index, timestamp, local_date, local_hour,
+                conversation_id, device, step_index, timestamp, local_date, local_hour,
                 event_type, model, is_api_request, unique_input_tokens, context_input_tokens,
                 output_tokens, thinking_tokens, tool_calls_count, subagent_spawns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             new_events,
         )
@@ -1173,6 +1212,7 @@ def scan_agy_directory(
     conn: sqlite3.Connection,
     agy_dir: Union[Path, Sequence[Path]],
     force: bool = False,
+    device: str = "local",
 ) -> Dict[str, Any]:
     """Incrementally (or forcibly) scan all transcripts across one or more `agy_dir` roots."""
     t0 = time.perf_counter()
@@ -1214,7 +1254,7 @@ def scan_agy_directory(
 
     updated_count = 0
     for conv_id, tx_path in transcripts:
-        if parse_conversation_incremental(conn, conv_id, tx_path, force=force):
+        if parse_conversation_incremental(conn, conv_id, tx_path, force=force, device=device):
             updated_count += 1
 
     conn.commit()
@@ -1361,6 +1401,8 @@ def seed_demo_data(conn: sqlite3.Connection, today: Optional[dt.date] = None) ->
         conv_id = f"demo-{idx + 1:02d}-{rng.randrange(16**8):08x}"
         title = _DEMO_TITLES[idx % len(_DEMO_TITLES)]
         demo_model = rng.choices(["gemini-3.8-flash", "claude-3-5-sonnet", "gemini-2.5-pro", "chatgpt-4o"], weights=[45, 30, 15, 10])[0]
+        # Realistic multi-device distribution across desktop workstation, laptop, and server
+        demo_device = rng.choices(["desktop-cachyos", "laptop-thinkpad", "dev-server"], weights=[55, 35, 10])[0]
 
         # Heavy architecture/debugging spike every ~5th session
         is_deep_session = (idx % 5 == 1) or (delta == 0)
@@ -1385,6 +1427,7 @@ def seed_demo_data(conn: sqlite3.Connection, today: Optional[dt.date] = None) ->
         event_rows.append(
             (
                 conv_id,
+                demo_device,
                 step_idx,
                 started_iso,
                 cur_dt.strftime("%Y-%m-%d"),
@@ -1443,6 +1486,7 @@ def seed_demo_data(conn: sqlite3.Connection, today: Optional[dt.date] = None) ->
             event_rows.append(
                 (
                     conv_id,
+                    demo_device,
                     step_idx,
                     ev_iso,
                     ev_date,
@@ -1473,6 +1517,7 @@ def seed_demo_data(conn: sqlite3.Connection, today: Optional[dt.date] = None) ->
                 event_rows.append(
                     (
                         conv_id,
+                        demo_device,
                         step_idx,
                         cur_dt.isoformat(timespec="seconds"),
                         cur_dt.strftime("%Y-%m-%d"),
@@ -1494,6 +1539,7 @@ def seed_demo_data(conn: sqlite3.Connection, today: Optional[dt.date] = None) ->
         conv_rows.append(
             (
                 conv_id,
+                demo_device,
                 f"demo://{conv_id}/transcript.jsonl",
                 title,
                 started_iso,
@@ -1517,22 +1563,22 @@ def seed_demo_data(conn: sqlite3.Connection, today: Optional[dt.date] = None) ->
     conn.executemany(
         """
         INSERT INTO conversations (
-            id, file_path, title, started_at, updated_at,
+            id, device, file_path, title, started_at, updated_at,
             mtime_ns, file_size, byte_offset, lines_parsed,
             running_context, has_user_title,
             api_requests, tool_calls, subagent_spawns,
             unique_input_tokens, context_input_tokens, output_tokens, thinking_tokens
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         conv_rows,
     )
     conn.executemany(
         """
         INSERT INTO events (
-            conversation_id, step_index, timestamp, local_date, local_hour,
+            conversation_id, device, step_index, timestamp, local_date, local_hour,
             event_type, model, is_api_request, unique_input_tokens, context_input_tokens,
             output_tokens, thinking_tokens, tool_calls_count, subagent_spawns
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         event_rows,
     )
@@ -1595,9 +1641,11 @@ class UsageTracker:
         db_path: Optional[str] = None,
         force_demo: bool = False,
         force_rescan: bool = False,
+        device_name: Optional[str] = None,
     ) -> None:
         self.lock = threading.RLock()
         self._cli_agy_dir = cli_agy_dir
+        self.device_name = device_name or get_machine_device_name()
         if agy_dir is not None and cli_agy_dir is None:
             self.agy_dirs: List[Path] = [agy_dir]
             self._pinned_single = True
@@ -1606,10 +1654,11 @@ class UsageTracker:
             self._pinned_single = False
         self.agy_dir = self.agy_dirs[0]
         self.force_demo = force_demo
-        self.db_path = resolve_db_path(self.agy_dir, cli_db=db_path, demo_mode=force_demo)
+        self.db_path = resolve_db_path(self.agy_dir, cli_db=db_path, demo_mode=force_demo, device_name=self.device_name)
 
         self._real_conn = init_sqlite_connection(self.db_path)
         self._demo_conn: Optional[sqlite3.Connection] = None
+        self._unified_conn: Optional[sqlite3.Connection] = None
         self.is_demo = False
         self.demo_reason: Optional[str] = None
         self.last_scanned_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -1621,10 +1670,70 @@ class UsageTracker:
         else:
             self.rescan(force=force_rescan)
 
+    def _rebuild_unified_conn(self) -> None:
+        """Discover all device SQLite databases in ~/.agy_dashboard and unify them into an in-memory view."""
+        if self.is_demo or self.force_demo:
+            return
+
+        peer_dbs: List[Path] = []
+        if DEFAULT_DASHBOARD_DIR.is_dir():
+            peer_dbs = sorted(DEFAULT_DASHBOARD_DIR.glob("*.db"))
+
+        # If no peer database exists or only local db file which matches self.db_path
+        real_path = Path(self.db_path).resolve() if self.db_path != ":memory:" else None
+        other_peers = [p for p in peer_dbs if real_path is None or p.resolve() != real_path]
+
+        if not other_peers:
+            if self._unified_conn is not None:
+                self._unified_conn.close()
+                self._unified_conn = None
+            return
+
+        # Build unified in-memory DB merging local and all peers
+        all_dbs: List[Path] = []
+        if real_path and real_path.exists():
+            all_dbs.append(real_path)
+        all_dbs.extend(other_peers)
+
+        new_unified = init_sqlite_connection(":memory:")
+        for idx, db_file in enumerate(all_dbs):
+            schema = f"peer_{idx}"
+            dev_fallback = db_file.stem
+            try:
+                new_unified.execute(f"ATTACH DATABASE '{db_file}' AS {schema}")
+                new_unified.execute(f"""
+                    INSERT OR REPLACE INTO conversations (id, device, file_path, title, started_at, updated_at, total_tokens, cost_usd, electricity_wh, co2_grams, water_liters, water_ml, api_requests, tool_calls)
+                    SELECT id, CASE WHEN device IS NULL OR device = '' OR device = 'local' THEN ? ELSE device END, file_path, title, started_at, updated_at, total_tokens, cost_usd, electricity_wh, co2_grams, water_liters, water_ml, api_requests, tool_calls
+                    FROM {schema}.conversations
+                """, (dev_fallback,))
+                new_unified.execute(f"""
+                    INSERT OR IGNORE INTO events (conversation_id, device, step_index, timestamp, local_date, local_hour, event_type, model, is_api_request, unique_input_tokens, context_input_tokens, output_tokens, thinking_tokens, tool_calls_count, subagent_spawns)
+                    SELECT conversation_id, CASE WHEN device IS NULL OR device = '' OR device = 'local' THEN ? ELSE device END, step_index, timestamp, local_date, local_hour, event_type, model, is_api_request, unique_input_tokens, context_input_tokens, output_tokens, thinking_tokens, tool_calls_count, subagent_spawns
+                    FROM {schema}.events
+                """, (dev_fallback,))
+                new_unified.execute(f"""
+                    INSERT OR IGNORE INTO tool_usages (conversation_id, device, step_index, tool_name, call_count, timestamp)
+                    SELECT conversation_id, CASE WHEN device IS NULL OR device = '' OR device = 'local' THEN ? ELSE device END, step_index, tool_name, call_count, timestamp
+                    FROM {schema}.tool_usages
+                """, (dev_fallback,))
+                new_unified.commit()
+                new_unified.execute(f"DETACH DATABASE {schema}")
+            except Exception:
+                try:
+                    new_unified.execute(f"DETACH DATABASE {schema}")
+                except Exception:
+                    pass
+
+        if self._unified_conn is not None:
+            self._unified_conn.close()
+        self._unified_conn = new_unified
+
     @property
     def _active_conn(self) -> sqlite3.Connection:
         if self.is_demo and not self.force_demo and self._demo_conn is not None:
             return self._demo_conn
+        if self._unified_conn is not None:
+            return self._unified_conn
         return self._real_conn
 
     def close(self) -> None:
@@ -1632,6 +1741,9 @@ class UsageTracker:
             if self._demo_conn is not None:
                 self._demo_conn.close()
                 self._demo_conn = None
+            if self._unified_conn is not None:
+                self._unified_conn.close()
+                self._unified_conn = None
             self._real_conn.close()
 
     def rescan(self, force: bool = False) -> Dict[str, Any]:
@@ -1663,7 +1775,7 @@ class UsageTracker:
                 self.agy_dirs = discover_agy_dirs(self._cli_agy_dir)
                 if self.agy_dirs:
                     self.agy_dir = self.agy_dirs[0]
-            scan_info = scan_agy_directory(self._real_conn, self.agy_dirs, force=force)
+            scan_info = scan_agy_directory(self._real_conn, self.agy_dirs, force=force, device=self.device_name)
             if scan_info["total_conversations"] > 0:
                 self.is_demo = False
                 self.demo_reason = None
@@ -1679,6 +1791,17 @@ class UsageTracker:
                     seed_demo_data(self._demo_conn)
                 self.is_demo = True
                 self.demo_reason = DEMO_AUTO_REASON
+
+            self._rebuild_unified_conn()
+            if self._unified_conn is not None:
+                total_unified = int(self._unified_conn.execute("SELECT COUNT(*) AS c FROM conversations").fetchone()["c"])
+                if total_unified > 0:
+                    self.is_demo = False
+                    self.demo_reason = None
+                    if self._demo_conn is not None:
+                        self._demo_conn.close()
+                        self._demo_conn = None
+                    scan_info["total_conversations"] = total_unified
 
             return {
                 "ok": True,
@@ -2216,6 +2339,8 @@ class UsageTracker:
                 "billing_mode": billing_norm,
                 "model_filter": model_norm,
                 "available_models": available_models,
+                "available_devices": self._get_available_devices(),
+                "current_device": self.device_name,
                 "pricing_profiles": PRICING_PROFILES,
             }
 
@@ -2232,6 +2357,17 @@ class UsageTracker:
                 "conversations": conversations_list,
                 "models_breakdown": models_breakdown,
             }
+
+    def _get_available_devices(self) -> List[str]:
+        """Return sorted list of distinct devices recorded across events and conversations."""
+        with self.lock:
+            rows = self._active_conn.execute(
+                "SELECT DISTINCT device FROM events WHERE device IS NOT NULL AND device != '' UNION SELECT DISTINCT device FROM conversations WHERE device IS NOT NULL AND device != '' ORDER BY device"
+            ).fetchall()
+            devs = [r[0] for r in rows if r[0]]
+            if not devs and self.device_name:
+                devs = [self.device_name]
+            return sorted(set(devs))
 
     def _get_available_models(self) -> List[str]:
         """Return sorted list of distinct models from events table (excludes 'unknown')."""
