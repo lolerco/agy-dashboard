@@ -1,96 +1,90 @@
-# Multi-Device Database Synchronization Proposal
+# Cross-Device Telemetry Synchronization Proposal
 
-This document outlines the architecture, data models, and synchronization strategies for synchronizing Google Antigravity (`agy`) telemetry databases across multiple developer machines (e.g., workstation, laptop, remote server) into a unified dashboard view.
+This document outlines the architectural proposal for synchronizing Google Antigravity (`agy`) telemetry databases across multiple machines (e.g. desktop workstation, laptop, remote server) into a unified usage tracking view.
 
 ---
 
-## 1. Zero-Collision Data Model
+## 1. Core Principles & Constraints
 
-Google Antigravity CLI assigns unique UUIDs to every session folder (e.g. `~/.gemini/antigravity-cli/brain/0dc1f693-fd59-46c3-a518-90789b3530b4`). Because conversation IDs are globally unique UUIDs, sessions generated across distinct devices will never collide.
+1. **Zero External Dependencies (Stdlib-Only):** Any syncing logic built into `agy_dashboard.py` must run on Python 3.9+ standard library without requiring external packages or complex daemons.
+2. **Collision-Free Data Model:** Antigravity generates version 4 UUIDs for all conversation IDs (e.g. `0dc1f693-fd59-46c3-a518-90789b3530b4`). Sessions across separate devices will never have conflicting primary keys.
+3. **Idempotency:** Re-syncing the same file or date range multiple times must produce identical results without duplicating tokens or events.
 
-### Schema Changes
+---
 
-Add device tagging across all primary telemetry tables:
+## 2. Schema Evolution: Device Identification
+
+To distinguish data origins and support multi-device analytics, we add `device_id` and `device_name` columns to our SQLite index:
 
 ```sql
 ALTER TABLE conversations ADD COLUMN device_id TEXT NOT NULL DEFAULT 'local';
 ALTER TABLE events ADD COLUMN device_id TEXT NOT NULL DEFAULT 'local';
 ALTER TABLE tool_usages ADD COLUMN device_id TEXT NOT NULL DEFAULT 'local';
-
-CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id);
-CREATE INDEX IF NOT EXISTS idx_conv_device ON conversations(device_id);
 ```
 
-### Device Identification
-
-- **Automatic fallback**: `socket.gethostname()`
-- **CLI override**: `--device <name>` (e.g. `agy_dashboard.py --device thinkpad-arch`)
-- **Friendly Metadata**: Optional alias and UI color tag (e.g. `Desktop Workstation` [Gruvbox Green], `MacBook Air` [Gruvbox Blue], `Hetzner Cloud` [Gruvbox Orange]).
+### Auto-Detection & Custom Overrides
+- **Default `device_id`:** Resolved via `socket.gethostname().lower().strip()` or configured via CLI flag `--device <id>`.
+- **Human-Readable Labels:** A config dictionary or CLI argument mapping device IDs to UI friendly names (e.g., `desktop-cachyos` → "Desktop Workstation", `thinkpad-x1` → "Laptop").
 
 ---
 
-## 2. Synchronization Mechanisms
+## 3. Synchronization Strategies
 
-### Option A: Direct Peer-to-Peer HTTP Sync (Recommended — 100% Stdlib)
+### Option A: Direct Peer-to-Peer HTTP Sync (Recommended)
+Since `agy_dashboard.py` already includes a built-in multi-threaded HTTP server, we can expose lightweight REST endpoints:
 
-Because `agy_dashboard.py` already includes a lightweight Python `http.server`, it can serve both web UI requests and peer-to-peer sync requests without third-party dependencies.
+1. **Endpoints:**
+   - `POST /api/sync/push`: Accepts a batch of JSON records from another device.
+   - `GET /api/sync/pull?since=<timestamp>`: Returns incremental records updated since the specified timestamp.
+   - Optional `--sync-secret <token>` header to prevent unauthorized access on local networks.
 
-1. **Primary/Host Device** (e.g. desktop workstation hosting the dashboard at `http://desktop.local:8765`):
-   - Exposes `/api/sync/push` and `/api/sync/pull`.
-   - Optional authentication token flag: `--sync-key <secret>`.
-2. **Secondary/Client Device** (e.g. laptop after working remotely):
-   - Runs a single sync command:
-     ```bash
-     python3 agy_dashboard.py --sync-to http://desktop.local:8765 [--sync-key <secret>]
-     ```
-   - Computes incremental records where `updated_at > last_sync_time`.
-   - Client transmits telemetry payload via `urllib.request`.
-   - Receiver performs `INSERT OR REPLACE INTO conversations ...`, keeping both datasets up to date.
-
-### Option B: Shared Directory / File-Drop Sync (Syncthing, Dropbox, Git, Network Share)
-
-Ideal for asynchronous or offline-first setups where devices are not online simultaneously:
-
-1. Each client periodically exports incremental JSONL/SQLite dumps to a designated sync folder:
-   `~/Sync/agy-telemetry/<device_id>.jsonl`
-2. The dashboard monitors or scans the sync folder:
+2. **Client CLI Command:**
    ```bash
-   python3 agy_dashboard.py --sync-dir ~/Sync/agy-telemetry/
+   # Push local telemetry to the primary workstation
+   python3 agy_dashboard.py --sync-to http://desktop.local:8765 --sync-secret mysecret
    ```
-3. On rescan or launch, files from all devices are ingested into the unified SQLite cache.
+   Implemented entirely with `urllib.request` and standard JSON serialization.
 
-### Option C: Multi-Path Brain Directory Mounting
+---
 
-Point the scanner to multiple local or mounted directories directly:
+### Option B: Shared Folder / Cloud Drive Export (Offline-First)
+For setups where devices are not online at the same time or use tools like Syncthing, Nextcloud, Dropbox, or Git-annex:
 
+1. **Export Command:**
+   ```bash
+   python3 agy_dashboard.py --export-device-sync ~/Sync/agy-telemetry/
+   ```
+   Writes an incremental JSONL or SQLite partition: `~/Sync/agy-telemetry/<device_id>.agy.db`.
+
+2. **Auto-Ingestion:**
+   When launching the dashboard with `--sync-dir ~/Sync/agy-telemetry/`, the scanner merges all remote device databases into the primary local cache.
+
+---
+
+### Option C: Multi-Path / Remote Brain Scanning
+Mount remote brain directories via SSHFS or NFS and point the scanner at multiple paths:
 ```bash
-python3 agy_dashboard.py \
-  --brain-dir local=~/.gemini/antigravity-cli/brain \
-  --brain-dir laptop=/mnt/laptop-brain/brain
+python3 agy_dashboard.py --brain-dir local=~/.gemini/antigravity-cli/brain --brain-dir laptop=/mnt/laptop/brain
 ```
 
 ---
 
-## 3. UI & Analytics Integration
+## 4. UI & Dashboard Analytics Experience
 
-### Top Bar Device Switcher
+1. **Top Bar Device Selector:**
+   A filter dropdown in the top action bar:
+   ```
+   [🖥️ All Devices (3) ▾]  [Live 10s]  [Rescan]  [CSV]  [📖 Glossar]
+     ├─ ● All Devices (Combined)
+     ├─ 💻 desktop-workstation (1.8M tok • 98 reqs)
+     ├─ 📱 thinkpad-laptop   (720K tok • 36 reqs)
+     └─ ☁️ vps-cloud-runner  (216K tok • 8 reqs)
+   ```
 
-Add a segmented control or dropdown in the top controls bar next to the live-polling and rescan actions:
+2. **Hour-of-Day Multi-Device Comparison:**
+   - View the 24-hour activity distribution per device.
+   - Stacked histogram bars showing which device was active at specific hours of the day.
+   - Multi-day productivity averages across devices.
 
-```text
-[🖥️ All Devices (3) ▾]  [Live 10s]  [Rescan]  [CSV]  [dark]  [📖 Glossar]
-  ├─ ● All Devices (Combined: 2.74M tok • 142 reqs)
-  ├─ 💻 desktop-cachyos (1.81M tok • 98 reqs)
-  ├─ 📱 laptop-thinkpad (718K tok • 36 reqs)
-  └─ ☁️ vps-remote     (216K tok • 8 reqs)
-```
-
-### Multi-Device Activity Analysis
-
-1. **Device-Aware Hour-of-Day Histogram**:
-   - Stacked bars indicating which hours and devices were most active across days.
-   - Multi-day averages comparing developer routines across machines.
-2. **Session Badging**:
-   - Distinct Gruvbox color badges per device in the **Recent Conversations** table.
-3. **Filtering**:
-   - Switching devices in the UI instantly filters KPI cards, token distribution charts, and session tables without a full page reload.
+3. **Session List Tagging:**
+   - Every session row displays a color-coded Gruvbox badge indicating the originating device.
