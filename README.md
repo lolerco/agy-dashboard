@@ -49,6 +49,7 @@ python3 agy_dashboard.py --summary
 | `--db <PATH>` | Local cache file | Path to the SQLite incremental cache file used to store parsed transcript metrics. |
 | `--no-browser` | `False` | Start the web server without automatically opening your default browser. |
 | `--demo` | `False` | Populate the dashboard (or `--summary`) with realistic synthetic telemetry data — useful for testing or previewing without local AGY logs. |
+| `--prune` | `False` | Prune records from SQLite if transcript files no longer exist on disk (default is false: preserves all history as a permanent archive). |
 | `--summary` | `False` | Print a concise telemetry report directly in the terminal and exit immediately. |
 | `--export-json <PATH>` | None | Export aggregated metrics and conversation summaries to a JSON file and exit. |
 

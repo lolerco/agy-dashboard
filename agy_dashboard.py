@@ -1213,8 +1213,13 @@ def scan_agy_directory(
     agy_dir: Union[Path, Sequence[Path]],
     force: bool = False,
     device: str = "local",
+    prune: bool = False,
 ) -> Dict[str, Any]:
-    """Incrementally (or forcibly) scan all transcripts across one or more `agy_dir` roots."""
+    """Incrementally (or forcibly) scan all transcripts across one or more `agy_dir` roots.
+
+    By default (prune=False), historical records are preserved in SQLite even if
+    transcripts are deleted from disk, keeping the database as a permanent archive.
+    """
     t0 = time.perf_counter()
     if force:
         conn.execute("DELETE FROM tool_usages")
@@ -1239,8 +1244,8 @@ def scan_agy_directory(
     transcripts = sorted([(cid, pair[1]) for cid, pair in merged_by_id.items()], key=lambda x: x[0])
     present_ids = {cid for cid, _ in transcripts}
 
-    # Prune deleted conversations only if explicit single brain_dir is used (keep archived scratch sessions)
-    if len(dirs) == 1 and any_dir_exists and not force:
+    # Only prune deleted conversations if explicitly requested (default: archive mode)
+    if prune and len(dirs) == 1 and any_dir_exists and not force:
         is_scratch = "hermes_agy_" in str(dirs[0]).lower() or "/scratch/" in str(dirs[0]).lower()
         if not is_scratch:
             existing_ids = {
@@ -1642,10 +1647,12 @@ class UsageTracker:
         force_demo: bool = False,
         force_rescan: bool = False,
         device_name: Optional[str] = None,
+        prune: bool = False,
     ) -> None:
         self.lock = threading.RLock()
         self._cli_agy_dir = cli_agy_dir
         self.device_name = device_name or get_machine_device_name()
+        self.prune = prune
         if agy_dir is not None and cli_agy_dir is None:
             self.agy_dirs: List[Path] = [agy_dir]
             self._pinned_single = True
@@ -1775,7 +1782,13 @@ class UsageTracker:
                 self.agy_dirs = discover_agy_dirs(self._cli_agy_dir)
                 if self.agy_dirs:
                     self.agy_dir = self.agy_dirs[0]
-            scan_info = scan_agy_directory(self._real_conn, self.agy_dirs, force=force, device=self.device_name)
+            scan_info = scan_agy_directory(
+                self._real_conn,
+                self.agy_dirs,
+                force=force,
+                device=self.device_name,
+                prune=self.prune,
+            )
             if scan_info["total_conversations"] > 0:
                 self.is_demo = False
                 self.demo_reason = None
@@ -2824,6 +2837,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Force full rebuild of SQLite cache from JSONL transcripts on startup",
     )
     parser.add_argument(
+        "--prune",
+        action="store_true",
+        default=False,
+        help="Prune conversations from SQLite if their transcript files no longer exist on disk (default: false, archive all)",
+    )
+    parser.add_argument(
         "--export-json",
         type=str,
         default=None,
@@ -2873,6 +2892,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         db_path=args.db,
         force_demo=args.demo,
         force_rescan=args.force_rescan,
+        prune=args.prune,
     )
 
     try:
