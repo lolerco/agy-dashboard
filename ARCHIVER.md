@@ -225,7 +225,7 @@ systemctl --user status agy-archiver.service
 |---|---|---|
 | `--once` | `False` | Run one complete sweep, index, zip, and cleanup cycle, then exit |
 | `--status` | `False` | Print current storage metrics, SQLite count, and ZIP size |
-| `--interval` | `3.0` | Inotify kernel wait timeout or poll interval in seconds |
+| `--interval` | `3.0` | Inotify wait in kernel select (zero CPU wakeups when idle) |
 | `--inactivity-threshold` | `60.0` | Inactive seconds before a session is zipped and cleaned |
 | `--index-interval` | `120.0` | Seconds between background SQLite indexing sweeps |
 | `--dashboard-dir` | `~/.agy_dashboard` | Target storage directory |
@@ -233,3 +233,11 @@ systemctl --user status agy-archiver.service
 | `--no-zip` | `False` | Disable zipping (leaves uncompressed files in staging) |
 | `--dry-run` | `False` | Simulate all operations without modifying disk or DB |
 | `-v`, `--verbose` | `False` | Print verbose operational logs |
+
+---
+
+## Multi-Device Synchronization & Deduplication
+
+- **Conversation UUID Deduplication**: Sessions across devices are keyed by UUID (`conversations.id`).
+- **Event Step Protection**: A unique index on `(conversation_id, step_index)` guarantees that merging multi-device databases never duplicates tokens or tool events.
+- **Origin Attribution**: Telemetry retains device provenance (`events.device` and `conversations.device`), allowing filtering across all systems or by individual machine in both the Web UI and CLI.
