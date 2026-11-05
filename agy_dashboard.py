@@ -2178,10 +2178,10 @@ class UsageTracker:
                     SUM(thinking_tokens) AS think_tok,
                     SUM(is_api_request) AS api_reqs
                 FROM events
-                WHERE local_date >= ? AND local_date <= ? {model_filter}
+                WHERE local_date >= ? AND local_date <= ? {filter_sql}
                 GROUP BY local_date
                 """,
-                (hm_start_str, today_str) + tuple(model_params),
+                (hm_start_str, today_str) + filter_params,
             ).fetchall()
             hm_map = {str(r["local_date"]): r for r in hm_rows}
             hm_raw_entries: List[Dict[str, Any]] = []
@@ -2533,11 +2533,11 @@ class UsageTracker:
                         SUM(tool_calls_count) AS tool_calls,
                         COUNT(DISTINCT conversation_id) AS conv_count
                     FROM events
-                    WHERE local_date >= ? AND local_date <= ? {filter_sql}
-                    GROUP BY local_date
-                    ORDER BY local_date ASC
+                    WHERE local_date >= ? AND local_date <= ?
+                    GROUP BY model
+                    ORDER BY (SUM(context_input_tokens) + SUM(output_tokens) + SUM(thinking_tokens)) DESC
                     """,
-                    (cutoff_str, today_str) + filter_params,
+                    (cutoff_str, today_str),
                 ).fetchall()
             else:
                 rows = conn.execute(
