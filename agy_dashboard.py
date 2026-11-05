@@ -1959,9 +1959,23 @@ class UsageTracker:
                 cutoff_date = today_date - dt.timedelta(days=n_days - 1)
                 cutoff_str = cutoff_date.strftime("%Y-%m-%d")
 
-            # Build model filter clause
-            model_filter = "" if model_norm == "all" else "AND model = ?"
-            model_params = [] if model_norm == "all" else [model_norm]
+            # Build filter clause for model and device
+            device_norm = str(device or "all").strip()
+            available_devices = self._get_available_devices()
+            if device_norm != "all" and device_norm not in available_devices:
+                device_norm = "all"
+
+            extra_filters = []
+            extra_params = []
+            if model_norm != "all":
+                extra_filters.append("model = ?")
+                extra_params.append(model_norm)
+            if device_norm != "all":
+                extra_filters.append("device = ?")
+                extra_params.append(device_norm)
+
+            filter_sql = ("AND " + " AND ".join(extra_filters)) if extra_filters else ""
+            filter_params = tuple(extra_params)
 
             # 1) Daily breakdown within selected window
             if cutoff_str is not None:
@@ -2445,7 +2459,8 @@ class UsageTracker:
                 "billing_mode": billing_norm,
                 "model_filter": model_norm,
                 "available_models": available_models,
-                "available_devices": self._get_available_devices(),
+                "available_devices": available_devices,
+                "device_selected": device_norm,
                 "current_device": self.device_name,
                 "pricing_profiles": PRICING_PROFILES,
                 "archive_zip_path": zip_info["path"],
@@ -2518,11 +2533,11 @@ class UsageTracker:
                         SUM(tool_calls_count) AS tool_calls,
                         COUNT(DISTINCT conversation_id) AS conv_count
                     FROM events
-                    WHERE local_date >= ? AND local_date <= ?
-                    GROUP BY model
-                    ORDER BY (SUM(context_input_tokens) + SUM(output_tokens) + SUM(thinking_tokens)) DESC
+                    WHERE local_date >= ? AND local_date <= ? {filter_sql}
+                    GROUP BY local_date
+                    ORDER BY local_date ASC
                     """,
-                    (cutoff_str, today_str),
+                    (cutoff_str, today_str) + filter_params,
                 ).fetchall()
             else:
                 rows = conn.execute(
