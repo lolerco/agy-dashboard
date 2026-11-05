@@ -885,6 +885,7 @@ CREATE TABLE IF NOT EXISTS tool_usages (
 
 CREATE INDEX IF NOT EXISTS idx_events_date ON events(local_date);
 CREATE INDEX IF NOT EXISTS idx_events_conv ON events(conversation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_conv_step ON events(conversation_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_tools_date ON tool_usages(local_date);
 CREATE INDEX IF NOT EXISTS idx_tools_conv ON tool_usages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at DESC);
@@ -920,6 +921,7 @@ def init_sqlite_connection(db_path: str) -> sqlite3.Connection:
     try:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_device ON events(device)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conv_device ON conversations(device)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_conv_step ON events(conversation_id, step_index)")
     except sqlite3.OperationalError:
         pass
     try:
