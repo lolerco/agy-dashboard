@@ -29,6 +29,7 @@ import threading
 import time
 import urllib.parse
 import webbrowser
+import zipfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -465,6 +466,84 @@ def get_machine_device_name() -> str:
 
 
 DEFAULT_DASHBOARD_DIR = Path.home() / ".agy_dashboard"
+if not DEFAULT_DASHBOARD_DIR.is_dir() and Path("/workspace/.agy_dashboard").is_dir():
+    DEFAULT_DASHBOARD_DIR = Path("/workspace/.agy_dashboard")
+
+
+def _fmt_bytes(num_bytes: Union[int, float]) -> str:
+    """Format byte counts into human-readable strings (e.g., '12.4 MB')."""
+    if num_bytes <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    val = float(num_bytes)
+    idx = 0
+    while val >= 1024.0 and idx < len(units) - 1:
+        val /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(val)} B"
+    return f"{val:.1f} {units[idx]}"
+
+
+def get_archive_zip_info(dashboard_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Inspect ~/.agy_dashboard/transcripts_archive.zip for compressed transcript metrics."""
+    base_dir = dashboard_dir or DEFAULT_DASHBOARD_DIR
+    candidates: List[Path] = [
+        base_dir / "transcripts_archive.zip",
+        base_dir / "archive.zip",
+        Path.home() / ".agy_dashboard" / "transcripts_archive.zip",
+        Path.home() / ".agy_dashboard" / "archive.zip",
+        Path("/workspace/.agy_dashboard/transcripts_archive.zip"),
+        Path("/workspace/.agy_dashboard/archive.zip"),
+    ]
+    zip_path: Optional[Path] = None
+    seen: set[str] = set()
+    for cand in candidates:
+        try:
+            res_str = str(cand.resolve())
+        except OSError:
+            res_str = str(cand)
+        if res_str in seen:
+            continue
+        seen.add(res_str)
+        if cand.is_file():
+            zip_path = cand
+            break
+
+    if not zip_path:
+        default_target = base_dir / "transcripts_archive.zip"
+        return {
+            "path": str(default_target),
+            "exists": False,
+            "size_bytes": 0,
+            "size_human": "None (0 B)",
+            "file_count": 0,
+        }
+
+    try:
+        st = zip_path.stat()
+        size_bytes = st.st_size
+        file_count = 0
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                file_count = len(zf.namelist())
+        except Exception:
+            pass
+        return {
+            "path": str(zip_path),
+            "exists": True,
+            "size_bytes": size_bytes,
+            "size_human": _fmt_bytes(size_bytes),
+            "file_count": file_count,
+        }
+    except OSError:
+        return {
+            "path": str(zip_path),
+            "exists": False,
+            "size_bytes": 0,
+            "size_human": "None (0 B)",
+            "file_count": 0,
+        }
 
 
 def resolve_db_path(
@@ -1709,8 +1788,18 @@ class UsageTracker:
             try:
                 new_unified.execute(f"ATTACH DATABASE '{db_file}' AS {schema}")
                 new_unified.execute(f"""
-                    INSERT OR REPLACE INTO conversations (id, device, file_path, title, started_at, updated_at, total_tokens, cost_usd, electricity_wh, co2_grams, water_liters, water_ml, api_requests, tool_calls)
-                    SELECT id, CASE WHEN device IS NULL OR device = '' OR device = 'local' THEN ? ELSE device END, file_path, title, started_at, updated_at, total_tokens, cost_usd, electricity_wh, co2_grams, water_liters, water_ml, api_requests, tool_calls
+                    INSERT OR REPLACE INTO conversations (
+                        id, device, file_path, title, started_at, updated_at, mtime_ns, file_size,
+                        byte_offset, lines_parsed, running_context, has_user_title, api_requests,
+                        tool_calls, subagent_spawns, unique_input_tokens, context_input_tokens,
+                        output_tokens, thinking_tokens
+                    )
+                    SELECT
+                        id, CASE WHEN device IS NULL OR device = '' OR device = 'local' THEN ? ELSE device END,
+                        file_path, title, started_at, updated_at, mtime_ns, file_size,
+                        byte_offset, lines_parsed, running_context, has_user_title, api_requests,
+                        tool_calls, subagent_spawns, unique_input_tokens, context_input_tokens,
+                        output_tokens, thinking_tokens
                     FROM {schema}.conversations
                 """, (dev_fallback,))
                 new_unified.execute(f"""
@@ -2341,6 +2430,7 @@ class UsageTracker:
             agy_label = str(self.agy_dir)
             if len(self.agy_dirs) > 1:
                 agy_label = f"{self.agy_dir} (+{len(self.agy_dirs) - 1} more)"
+            zip_info = get_archive_zip_info()
             meta_obj: Dict[str, Any] = {
                 "agy_dir": agy_label,
                 "db_path": self.db_path,
@@ -2355,6 +2445,11 @@ class UsageTracker:
                 "available_devices": self._get_available_devices(),
                 "current_device": self.device_name,
                 "pricing_profiles": PRICING_PROFILES,
+                "archive_zip_path": zip_info["path"],
+                "archive_zip_size": zip_info["size_human"],
+                "archive_zip_bytes": zip_info["size_bytes"],
+                "archive_zip_exists": zip_info["exists"],
+                "archive_zip_count": zip_info["file_count"],
             }
 
             # Get per-model breakdown for all models (ignoring current model filter)
@@ -2726,6 +2821,11 @@ def format_terminal_summary(stats: Dict[str, Any]) -> str:
     if meta["is_demo"] and meta.get("demo_reason"):
         lines.append(f"  Notice       : {meta['demo_reason']}")
     lines.append(f"  Brain Dir    : {meta['agy_dir']}")
+    zip_display = meta.get("archive_zip_size", "None (0 B)")
+    if meta.get("archive_zip_count", 0) > 0:
+        zip_file_name = Path(meta.get("archive_zip_path", "transcripts_archive.zip")).name
+        zip_display += f"  ({meta['archive_zip_count']} files in {zip_file_name})"
+    lines.append(f"  Zip Archive  : {zip_display}")
     lines.append(f"  Billing Mode : {billing_label}")
     lines.append(f"  Pricing Tier : {profile_info['label']} (${profile_info['input']:.2f} / ${profile_info['output']:.2f} per 1M tok)")
     lines.append(sep)
