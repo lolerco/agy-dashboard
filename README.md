@@ -39,6 +39,47 @@ python3 agy_dashboard.py --summary
 
 ---
 
+## Background Archiver & Systemd Installation (`agy_archiver.py`)
+
+If you interact with Gemini through **Hermes Agent** or run frequent Antigravity sessions, Hermes isolates each execution in a temporary scratch directory (`~/.hermes/cache/scratch/hermes_agy_*`) and **deletes it upon session termination (`/quit`)**. Without a continuous background watcher, these ephemeral sessions and their token counts are lost forever.
+
+The repository provides **`agy_archiver.py`**, an ultra-low-power, zero-dependency background daemon that solves this non-invasively:
+1. **Immediate Inode Hardlinking:** Captures new `transcript.jsonl` files within milliseconds using hardlinks, allowing transcripts to continue receiving live writes and survive Hermes unlinking its scratch directory.
+2. **Zero-Polling Linux `inotify`:** Uses kernel events via standard library `ctypes` (`libc.so.6`). When idling, it consumes **0.00% CPU and zero battery**.
+3. **Automatic Deduplication:** Discovers both Hermes and Standalone AGY sessions, deduplicating conversations by UUID in SQLite so no session is ever double-counted.
+4. **Database Indexing & ZIP Storage Optimization:** Once a session finishes, it triggers SQLite database indexing and compresses completed transcripts into `~/.agy_dashboard/transcripts_archive.zip`, freeing raw disk space while keeping permanent token history.
+
+### Automated 1-Step Installation (`install.sh`)
+
+To install, configure, and start the archiver as a persistent systemd user service:
+
+```bash
+./install.sh
+```
+
+#### What `install.sh` performs:
+- **Environment verification:** Confirms Python 3.9+ is installed and sets execute permissions on `agy_archiver.py`.
+- **Dynamic service configuration:** Generates `~/.config/systemd/user/agy-archiver.service` tailored to your machine's exact Python executable and project directory path.
+- **Power & priority optimization:** Configures `Nice=10` and `IOSchedulingClass=best-effort` for unobtrusive background operation.
+- **Service enablement & startup:** Runs `systemctl --user daemon-reload` and `systemctl --user enable --now agy-archiver.service`. (In containers or shells lacking an active D-Bus session bus, it automatically links into `default.target.wants` and outputs host startup commands).
+- **Initial sync verification:** Runs an immediate synchronization pass (`agy_archiver.py --once`) to ingest existing transcripts into SQLite.
+
+### Managing the Archiver Service
+
+| Action | Command |
+| :--- | :--- |
+| **Check service status** | `./install.sh --status` *(or `systemctl --user status agy-archiver.service`)* |
+| **View live logs** | `journalctl --user -u agy-archiver.service -f` |
+| **Restart service** | `systemctl --user restart agy-archiver.service` |
+| **Stop & uninstall** | `./install.sh --uninstall` |
+| **Run single sync pass** | `python3 agy_archiver.py --once` |
+| **Inspect archive stats** | `python3 agy_archiver.py --status` |
+
+> 📖 **Deep Dive Documentation:** For full architectural diagrams, hardlink mechanics, double-count prevention, and ZIP retention details, see [ARCHIVER.md](ARCHIVER.md).
+
+
+---
+
 ## CLI Options Reference
 
 | Option | Default | Description |

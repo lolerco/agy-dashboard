@@ -177,7 +177,20 @@ Traditional background monitors run `while True: sleep(3)` loops, which wake the
 
 ## Installation & Service Setup
 
-### Option A: Systemd User Service (Recommended)
+### Option A: Automated Systemd Installer (Recommended)
+Run the automated installer script, which detects paths, configures the unit file, enables, and starts the service:
+
+```bash
+./install.sh
+```
+
+To check status or manage the service later:
+```bash
+./install.sh --status        # View systemctl --user status
+./install.sh --uninstall     # Stop, disable, and clean up service unit
+```
+
+### Option B: Manual Systemd Setup
 A ready-to-use user service definition is provided in `agy-archiver.service`:
 
 ```bash
@@ -193,7 +206,7 @@ systemctl --user enable --now agy-archiver.service
 systemctl --user status agy-archiver.service
 ```
 
-### Option B: Manual CLI Execution
+### Option C: Manual CLI Execution
 
 ```bash
 # Check status of staging, database, and zip archive

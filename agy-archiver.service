@@ -5,11 +5,10 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /workspace/projects/programming/agy-usage-tracker/agy_archiver.py --interval 3.0 --inactivity-threshold 60.0 --index-interval 120.0
+ExecStart=/usr/local/bin/python3 /workspace/projects/programming/agy-usage-tracker/agy_archiver.py --interval 3.0 --inactivity-threshold 60.0 --index-interval 120.0
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
-Environment=HOME=/workspace
 WorkingDirectory=/workspace/projects/programming/agy-usage-tracker
 
 # Power and battery efficiency: low IO and CPU scheduling
