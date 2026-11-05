@@ -1921,6 +1921,7 @@ class UsageTracker:
         pricing: str = "blended",
         billing_mode: str = "context",
         model: str = "all",
+        device: str = "all",
     ) -> Dict[str, Any]:
         """Compute the full `/api/stats` payload."""
         days_norm = str(days or "30").strip().lower()
@@ -1977,11 +1978,11 @@ class UsageTracker:
                         SUM(subagent_spawns) AS subagents,
                         COUNT(DISTINCT conversation_id) AS conv_count
                     FROM events
-                    WHERE local_date >= ? AND local_date <= ?
+                    WHERE local_date >= ? AND local_date <= ? {filter_sql}
                     GROUP BY local_date
                     ORDER BY local_date ASC
                     """,
-                    (cutoff_str, today_str),
+                    (cutoff_str, today_str) + filter_params,
                 ).fetchall()
             else:
                 daily_rows = conn.execute(
@@ -1997,11 +1998,11 @@ class UsageTracker:
                         SUM(subagent_spawns) AS subagents,
                         COUNT(DISTINCT conversation_id) AS conv_count
                     FROM events
-                    WHERE 1=1 {model_filter}
+                    WHERE 1=1 {filter_sql}
                     GROUP BY local_date
                     ORDER BY local_date ASC
                     """,
-                    tuple(model_params),
+                    filter_params,
                 ).fetchall()
 
             by_date: Dict[str, sqlite3.Row] = {str(r["local_date"]): r for r in daily_rows}
@@ -2212,10 +2213,10 @@ class UsageTracker:
                         SUM(thinking_tokens) AS think_tok,
                         SUM(is_api_request) AS api_reqs
                     FROM events
-                    WHERE local_date >= ? AND local_date <= ? {model_filter}
+                    WHERE local_date >= ? AND local_date <= ? {filter_sql}
                     GROUP BY local_hour
                     """,
-                    (cutoff_str, today_str) + tuple(model_params),
+                    (cutoff_str, today_str) + filter_params,
                 ).fetchall()
             else:
                 hr_rows = conn.execute(
@@ -2228,10 +2229,10 @@ class UsageTracker:
                         SUM(thinking_tokens) AS think_tok,
                         SUM(is_api_request) AS api_reqs
                     FROM events
-                    WHERE 1=1 {model_filter}
+                    WHERE 1=1 {filter_sql}
                     GROUP BY local_hour
                     """,
-                    tuple(model_params),
+                    filter_params,
                 ).fetchall()
 
             hr_map = {int(r["local_hour"]): r for r in hr_rows}
@@ -2698,8 +2699,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             pricing = qs.get("pricing", ["blended"])[0]
             billing_mode = qs.get("billing_mode", ["context"])[0]
             model = qs.get("model", ["all"])[0]
+            device = qs.get("device", ["all"])[0]
             stats = self.server.tracker.get_stats(
-                days=days, pricing=pricing, billing_mode=billing_mode, model=model
+                days=days, pricing=pricing, billing_mode=billing_mode, model=model, device=device
             )
             self._send_json(stats)
             return
