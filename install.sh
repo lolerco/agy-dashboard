@@ -134,9 +134,7 @@ IOSchedulingPriority=6
 WantedBy=default.target
 EOF
 
-# Also keep repo template synced
-cp "${TARGET_SERVICE}" "${PROJECT_DIR}/agy-archiver.service"
-echo -e "  ${GREEN}✓${RESET} Created ${TARGET_SERVICE}"
+echo -e "  ${GREEN}\u2713${RESET} Created ${TARGET_SERVICE}"
 
 # 4. Enable and start service via systemctl
 echo -e "${BOLD}[4/5] Enabling and starting service...${RESET}"
