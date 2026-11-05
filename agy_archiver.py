@@ -26,6 +26,7 @@ import os
 import select
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -159,19 +160,63 @@ class LinuxInotifyWatcher:
         except Exception:
             return -1
 
+    def add_watch_tree(self, root: Path, max_depth: int = 8) -> int:
+        """Recursively attach watches to root and all existing subdirectories."""
+        if not self.is_available or not root.is_dir():
+            return 0
+        added = 0
+        if self.add_watch(root) >= 0:
+            added += 1
+        try:
+            for dirpath, dirnames, _ in os.walk(str(root)):
+                dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__", "archive")]
+                rel_depth = len(Path(dirpath).parts) - len(root.parts)
+                if rel_depth > max_depth:
+                    dirnames[:] = []
+                    continue
+                p = Path(dirpath)
+                if p != root and self.add_watch(p) >= 0:
+                    added += 1
+        except OSError:
+            pass
+        return added
+
     def wait_for_events(self, timeout_sec: float) -> bool:
+        """Sleep in kernel select until inotify events arrive. Return True if events occurred."""
         if not self.is_available or self.fd is None:
             time.sleep(timeout_sec)
             return True
         try:
             r, _, _ = select.select([self.fd], [], [], timeout_sec)
-            if r:
-                try:
-                    os.read(self.fd, 4096)
-                except OSError:
-                    pass
+            if not r:
+                return False
+            try:
+                buf = os.read(self.fd, 16384)
+            except OSError:
                 return True
-            return False
+
+            # Parse event structs to dynamically watch newly created directories
+            offset = 0
+            event_fmt = "iIII"
+            event_size = struct.calcsize(event_fmt)
+            while offset + event_size <= len(buf):
+                wd, mask, _cookie, name_len = struct.unpack_from(event_fmt, buf, offset)
+                offset += event_size
+                name = ""
+                if name_len > 0:
+                    raw_name = buf[offset : offset + name_len]
+                    offset += name_len
+                    name = raw_name.split(b"\x00", 1)[0].decode("utf-8", errors="ignore")
+
+                # Dynamically attach inotify watches to newly created subdirectories
+                if (mask & self.IN_ISDIR) and (mask & (self.IN_CREATE | self.IN_MOVED_TO)):
+                    parent_path_str = self.watch_descriptors.get(wd)
+                    if parent_path_str:
+                        new_dir = Path(parent_path_str) / name
+                        if new_dir.is_dir():
+                            self.add_watch_tree(new_dir, max_depth=4)
+
+            return True
         except Exception:
             time.sleep(timeout_sec)
             return True
@@ -375,11 +420,15 @@ class AgyArchiver:
             if not is_ready and meta:
                 source_dir = meta.get("source_dir")
                 source_alive = source_dir and Path(source_dir).is_dir()
-                if not source_alive:
-                    # Hermes scratch dir was removed on exit -> session complete!
-                    is_ready = True
-                elif now - meta.get("last_seen_mtime", 0) >= self.inactivity_threshold:
-                    is_ready = True
+                is_scratch = "hermes" in str(source_dir).lower() or "scratch" in str(source_dir).lower()
+                if is_scratch:
+                    # Ephemeral Hermes scratchpad: NEVER archive/unlink while Hermes session is still alive!
+                    if not source_alive:
+                        is_ready = True
+                else:
+                    # Standalone/permanent directory: safe after inactivity threshold
+                    if now - meta.get("last_seen_mtime", 0) >= self.inactivity_threshold:
+                        is_ready = True
             elif not is_ready:
                 # If not tracked in active memory, check disk mtime
                 logs = conv_dir / ".system_generated" / "logs"
@@ -397,6 +446,27 @@ class AgyArchiver:
             self.log(f"[DRY RUN] Would zip and clean {len(to_archive)} conversations")
             return len(to_archive), 0
 
+        # Check if any conversation already in the ZIP has updated (grown in size)
+        needs_repack = False
+        if self.zip_path.is_file():
+            try:
+                with zipfile.ZipFile(self.zip_path, "r") as zf_check:
+                    zip_info_map = {zi.filename: zi for zi in zf_check.infolist()}
+                    for conv_id, conv_dir in to_archive:
+                        for jf in conv_dir.glob("**/*.jsonl"):
+                            arcname = f"brain/{conv_id}/{jf.relative_to(conv_dir)}"
+                            if arcname in zip_info_map:
+                                if jf.stat().st_size != zip_info_map[arcname].file_size:
+                                    needs_repack = True
+                                    break
+                        if needs_repack:
+                            break
+            except Exception:
+                pass
+
+        if needs_repack:
+            return self._repack_zip_with_updated(to_archive)
+
         # Append to zip file
         zipped_files_count = 0
         cleaned_convs_count = 0
@@ -408,7 +478,6 @@ class AgyArchiver:
                     jsonl_files = list(conv_dir.glob("**/*.jsonl"))
                     for jf in jsonl_files:
                         arcname = f"brain/{conv_id}/{jf.relative_to(conv_dir)}"
-                        # Only write if not already in zip or if size differs
                         if arcname not in existing_zip_names:
                             zf.write(jf, arcname)
                             existing_zip_names.add(arcname)
@@ -431,6 +500,52 @@ class AgyArchiver:
             self.log(f"Error creating/updating zip {self.zip_path}: {exc}")
 
         return cleaned_convs_count, zipped_files_count
+
+    def _repack_zip_with_updated(self, to_archive: List[Tuple[str, Path]]) -> Tuple[int, int]:
+        """Atomically repack zip file when archived transcripts have grown in size."""
+        temp_zip = self.zip_path.with_name(f"{self.zip_path.name}.tmp.{os.getpid()}")
+        updated_conv_ids = {conv_id for conv_id, _ in to_archive}
+        repacked_count = 0
+        cleaned_convs = 0
+
+        try:
+            with zipfile.ZipFile(temp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf_out:
+                if self.zip_path.is_file():
+                    with zipfile.ZipFile(self.zip_path, "r") as zf_in:
+                        for item in zf_in.infolist():
+                            parts = item.filename.split("/")
+                            c_id = parts[1] if len(parts) > 1 else ""
+                            if c_id not in updated_conv_ids:
+                                zf_out.writestr(item, zf_in.read(item.filename))
+
+                for conv_id, conv_dir in to_archive:
+                    for jf in conv_dir.glob("**/*.jsonl"):
+                        arcname = f"brain/{conv_id}/{jf.relative_to(conv_dir)}"
+                        zf_out.write(jf, arcname)
+                        repacked_count += 1
+
+            temp_zip.replace(self.zip_path)
+
+            for conv_id, conv_dir in to_archive:
+                for jf in conv_dir.glob("**/*.jsonl"):
+                    try:
+                        jf.unlink()
+                    except OSError:
+                        pass
+                try:
+                    shutil.rmtree(conv_dir)
+                    cleaned_convs += 1
+                except OSError:
+                    pass
+            return cleaned_convs, repacked_count
+        except Exception as exc:
+            self.log(f"Error repacking zip: {exc}")
+            if temp_zip.exists():
+                try:
+                    temp_zip.unlink()
+                except OSError:
+                    pass
+            return 0, 0
 
     def get_status_report(self) -> Dict[str, Any]:
         indexed_ids = self.get_indexed_conversation_ids()
@@ -488,8 +603,8 @@ class AgyArchiver:
         watcher = LinuxInotifyWatcher()
         if watcher.is_available:
             for root in get_scan_roots():
-                watcher.add_watch(root)
-            self.log(f"Attached inotify to {len(watcher.watch_descriptors)} scan roots")
+                watcher.add_watch_tree(root)
+            self.log(f"Attached inotify to {len(watcher.watch_descriptors)} scan directories")
         else:
             self.log("inotify not available; using adaptive low-power sleep")
 
@@ -500,11 +615,16 @@ class AgyArchiver:
             self.zip_and_cleanup_completed(force_all=False)
 
             while True:
-                watcher.wait_for_events(interval)
-                self.sweep()
-
+                had_events = watcher.wait_for_events(interval)
                 now = time.time()
-                if now - self.last_index_time >= self.index_interval:
+                time_for_index = (now - self.last_index_time >= self.index_interval)
+
+                if had_events:
+                    self.sweep()
+
+                if time_for_index:
+                    if not had_events:
+                        self.sweep()
                     self.trigger_indexing()
                     self.zip_and_cleanup_completed(force_all=False)
         except KeyboardInterrupt:
