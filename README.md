@@ -106,26 +106,6 @@ python3 agy_dashboard.py --agy-dir /path/to/.gemini/antigravity-cli/brain --expo
 
 ---
 
-## Sharing with Friends (Linux, macOS & Windows)
-
-Because the entire backend, SQLite indexer, CLI reporter, and Linear-styled web frontend live inside **one self-contained `.py` file**, sharing takes seconds:
-
-1. Send or copy **`agy_dashboard.py`** (single file — nothing else required).
-2. Ensure **Python 3.9+** is installed (`python3 --version` or `python --version`).
-3. Run it — `agy_dashboard.py` automatically locates the default Antigravity transcript directory for each OS:
-
-| Platform | Default Transcript Directory (`brain`) | Run Command |
-| :--- | :--- | :--- |
-| **Linux** | `~/.gemini/antigravity-cli/brain` | `python3 agy_dashboard.py` |
-| **macOS** | `~/.gemini/antigravity-cli/brain` | `python3 agy_dashboard.py` |
-| **Windows** | `%USERPROFILE%\.gemini\antigravity-cli\brain` | `python agy_dashboard.py` |
-
-> **Privacy First:** Everything runs locally on `127.0.0.1`. Conversation transcripts, prompts, code snippets, and SQLite caches never leave your machine.
-
-If a friend uses Hermes Agent with isolated scratch home directories (e.g., `~/.hermes/cache/scratch/.../home/.gemini/antigravity-cli/brain`), pass `--agy-dir` pointing to that path.
-
----
-
 ## How Metrics Are Calculated
 
 ### 1. Transcript Parsing & `transcript_full.jsonl` Truncation Resolution
@@ -153,7 +133,7 @@ Environmental estimates model active LLM inference physics rather than flat per-
 ### 5. Incremental SQLite Caching & Multi-Device Synchronization
 Parsing thousands of `.jsonl` agent trajectories on every page load is slow. `agy_dashboard.py` uses Python's built-in `sqlite3` module to persist computed per-conversation, daily, hourly, and tool statistics keyed by transcript path, modification timestamp (`mtime`), and file size. Unchanged sessions load instantaneously from SQLite; only newly created or actively growing transcripts are re-indexed.
 
-#### Multi-Device Syncing with Syncthing (or Git / rsync)
+## Multi-Device Syncing with Syncthing (or Git / rsync)
 Each machine maintains its own isolated database under `~/.agy_dashboard/<device_name>.db` (defaulting to the host machine's hostname). When syncing across multiple devices, `agy_dashboard.py` automatically discovers all `*.db` files in `~/.agy_dashboard/` and unifies them in-memory, allowing cross-device stats, filtering, and badging without database file locking conflicts.
 
 **Setting up with Syncthing:**
